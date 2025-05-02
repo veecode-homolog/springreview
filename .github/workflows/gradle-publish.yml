@@ -33,7 +33,7 @@ jobs:
           BOOT_DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }} #used by build.gradle      
         run: |
           ./gradlew bootBuildImage \
-          --imageName=docker.io/veecode/springreview:latest \
+          --imageName=docker.io/veecode-homolog/springreview:latest \
           --publishImage
 
       - name: Setting up kubectl client
