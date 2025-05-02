@@ -3,7 +3,7 @@ kind: API
 metadata:
   name: springreview
   title: springreview
-  publishedAt: "2025-05-02 16:33:12"
+  publishedAt: "2025-05-02 16:36:12"
   description: 'springreview Swagger at [http://swagger.io](http://swagger.io) or on [irc.freenode.net, #swagger](http://swagger.io/irc/).  For this sample, you can use the api key `special-key` to test the authorization filters.'
   tags:
     - rest
