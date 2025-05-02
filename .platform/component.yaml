@@ -1,0 +1,20 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: springreview
+  description: "test"
+  annotations:
+    github.com/project-slug: veecode-homolog/springreview
+    backstage.io/techdocs-ref: dir:..
+    backstage.io/kubernetes-id: "springreview"
+    vault.io/secrets-path: "springreview"
+    grafana/dashboard-selector: "springreview"
+    grafana/alert-label-selector: "alertname=springreview"
+    argocd/proxy-url: '/argocd/api'
+    argocd/app-name: "springreview"
+    kong-manager/service-name: veecode-homolog.springreview-service-0.8080
+    kong-manager/instance: /kong-manager/api
+spec:
+  type: service
+  lifecycle: experimental
+  owner: "group:default/admin"

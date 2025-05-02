@@ -1,0 +1,231 @@
+
+name: Build Publish Spring Boot 
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  PROJECT_NAME: springreview
+  CLUSTER_DOMAIN: "rest.vee.codes"
+
+jobs:
+  build-project:
+    runs-on: ubuntu-latest
+    env:
+      DESTINATION_SERVER: https://3.217.41.254:6550
+      DESTINATION_NAMESPACE: vkpr
+      CORS_LIST: https://devportal.apr.vee.codes, https://devportal-homolog.apr.vee.codes
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up JDK 17
+        uses: actions/setup-java@v3
+        with:
+          java-version: 17
+          distribution: 'adopt'
+      
+      - name: Validate Gradle wrapper
+        uses: gradle/wrapper-validation-action@e6e38bacfdf1a337459f332974bb2327a31aaf4b
+     
+      - name: Build with Gradle
+        env:
+          BOOT_DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }} #used by build.gradle
+          BOOT_DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }} #used by build.gradle      
+        run: |
+          ./gradlew bootBuildImage \
+          --imageName=docker.io/veecode/springreview:latest \
+          --publishImage
+
+      - name: Setting up kubectl client
+        uses: azure/setup-kubectl@v3
+        with:
+           version: 'latest' # default is latest stable
+        id: install
+
+      - name: Creating K8s Artifacts
+        run: |
+          mkdir k8s/
+          mkdir config/
+          touch config/springreview.yaml
+
+          echo "
+          kind: KongPlugin
+          apiVersion: configuration.konghq.com/v1
+          metadata:
+            name: $PROJECT_NAME-cors
+            namespace: $DESTINATION_NAMESPACE
+            annotations:
+              kubernetes.io/ingress.class: kong
+          plugin: cors
+          config:
+            origins: []
+          " > ./k8s/kong-plugin.yaml
+          yq eval ".config.origins = (strenv(CORS_LIST) | sub(\" +\", \"\") | split(\",\"))" -i "./k8s/kong-plugin.yaml"
+
+          kubectl create deployment springreview --namespace=veecode-homolog --port=8080 --replicas=1 \
+          --image=docker.io/veecode/springreview:latest --dry-run=client -o=yaml > ./k8s/deployment.yaml
+
+          yq e '''
+          .metadata.labels."backstage.io/kubernetes-id"=strenv(PROJECT_NAME) |
+          .spec.template.metadata.labels."backstage.io/kubernetes-id"=strenv(PROJECT_NAME) |
+          .spec.template.spec.containers[0].imagePullPolicy= "IfNotPresent" |
+          .spec.template.spec.containers[0].resources.requests.memory= "256Mi" |
+          .spec.template.spec.containers[0].resources.limits.memory= "768Mi" |
+          .spec.template.metadata.annotations."sidecar.opentelemetry.io/inject"= "true" |
+          .spec.template.metadata.annotations."instrumentation.opentelemetry.io/inject-java"= "true" |
+          del(.status) | del(.metadata.creationTimestamp) | del(.spec.template.metadata.creationTimestamp) | del(.spec.strategy)
+          ''' -i ./k8s/deployment.yaml
+
+          kubectl create service clusterip springreview-service-0 --namespace=veecode-homolog \
+          --tcp=8080:8080 --dry-run=client -o=yaml > ./k8s/service.yaml
+          yq e '''
+          .metadata.annotations."sidecar.opentelemetry.io/inject"= "true" |
+          .metadata.annotations."instrumentation.opentelemetry.io/inject-java"= "true" |
+          del(.metadata.creationTimestamp) | del(.status) |
+          .metadata.labels."backstage.io/kubernetes-id"=strenv(PROJECT_NAME)
+          ''' -i ./k8s/service.yaml
+          yq e '.spec.selector.app=strenv(PROJECT_NAME)' -i ./k8s/service.yaml
+
+          kubectl create ingress springreview --class=kong --namespace=veecode-homolog \
+          --annotation "cert-manager.io/cluster-issuer"="certmanager-issuer" \
+          --annotation "konghq.com/https-redirect-status-code"="308" \
+          --annotation "kubernetes.io/tls-acme"="true" \
+          --annotation "konghq.com/strip-path"="true" \
+          --annotation "konghq.com/preserve-host"="true" \
+          --annotation "konghq.com/protocols"="https" \
+          --annotation "konghq.com/plugins"="$PROJECT_NAME-cors" \
+          --annotation "sidecar.opentelemetry.io/inject"="true" \
+          --annotation "instrumentation.opentelemetry.io/inject-java"="true" \
+          --rule="rest.apr.vee.codes/springreview*=springreview-service-0:8080,tls=rest.apr.vee.codes-tls" --dry-run=client -o=yaml > ./k8s/ingress.yaml
+          yq e 'del(.metadata.creationTimestamp) | del(.status)' -i ./k8s/ingress.yaml
+          yq e '.metadata.labels."backstage.io/kubernetes-id"=strenv(PROJECT_NAME)' -i ./k8s/ingress.yaml
+
+          yq e '''
+              .apiVersion="argoproj.io/v1alpha1" |
+              .kind="Application" |
+              .metadata.name=strenv(PROJECT_NAME) |
+              .metadata.namespace="argocd" |
+              .spec.project="default" |
+              .spec.source.repoURL="https://github.com/veecode-demo01/oci-demo/projetos/argo-repository.git" |
+              .spec.source.targetRevision="main" |
+              .spec.source.path="springreview/" |
+              .spec.syncPolicy.automated.prune=true |
+              .spec.syncPolicy.syncOptions[0]="CreateNamespace=true" |
+              .spec.destination.server=strenv(DESTINATION_SERVER) |
+              .spec.destination.namespace=strenv(DESTINATION_NAMESPACE)''' -i config/springreview.yaml   
+       
+      - name: Check grafana url
+        run: |
+          export GRAFANA_URL=https://grafana.vee.codes
+          echo "CHECKED_URL=${GRAFANA_URL%/}"
+          echo "CHECKED_URL=${GRAFANA_URL%/}" >> $GITHUB_ENV
+          
+      - name: Creating K8s Dashboards Artifacts
+        run: |
+          export UID_METRICS_DASHBOARD=$(curl -H "Authorization: Bearer ${{ secrets.GRAFANA_API_TOKEN }}" --url ${{ env.CHECKED_URL }}/api/datasources | jq '.[] | select(.type == "prometheus")'.uid)
+          export UID_LOG_DASHBOARD=$(curl -H "Authorization: Bearer ${{ secrets.GRAFANA_API_TOKEN }}" --url ${{ env.CHECKED_URL }}/api/datasources | jq '.[] | select(.type == "loki")'.uid)
+          export UID_TRACE_DASHBOARD=$(curl -H "Authorization: Bearer ${{ secrets.GRAFANA_API_TOKEN }}" --url ${{ env.CHECKED_URL }}/api/datasources | jq '.[] | select(.type == "jaeger")'.uid)
+      
+          jq "(.panels[].datasource | select(.type == \"jaeger\")).uid |= $UID_TRACE_DASHBOARD" dashboards/jaeger-trace.json > jaeger-trace-springreview.json
+          kubectl create configmap jaeger-trace-springreview --from-file=./jaeger-trace-springreview.json --dry-run=client -o=yaml > dashboards/jaeger-trace.yml
+          yq eval ".metadata.labels.grafana_dashboard=\"vkpr\" | del(.metadata.creationTimestamp)" -i dashboards/jaeger-trace.yml
+
+          jq "(.panels[].datasource | select(.type == \"loki\")).uid |= $UID_LOG_DASHBOARD" dashboards/loki-logs.json > loki-logs-springreview.json
+          kubectl create configmap loki-logs-springreview --from-file=./loki-logs-springreview.json --dry-run=client -o=yaml > dashboards/loki-logs.yml
+          yq eval ".metadata.labels.grafana_dashboard=\"vkpr\" | del(.metadata.creationTimestamp)" -i dashboards/loki-logs.yml
+
+          jq "(.panels[].datasource | select(.type == \"prometheus\")).uid |= $UID_METRICS_DASHBOARD" dashboards/kong-metrics.json > kong-metrics-springreview.json
+          kubectl create configmap kong-metrics-springreview --from-file=./kong-metrics-springreview.json --dry-run=client -o=yaml > dashboards/kong-metrics.yml
+          yq eval ".metadata.labels.grafana_dashboard=\"vkpr\" | del(.metadata.creationTimestamp)" -i dashboards/kong-metrics.yml
+              
+          cp ./dashboards/*.yml ./k8s
+
+      - name: Publish K8S Artifact
+        uses: dmnemec/copy_file_to_another_repo_action@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.API_TOKEN_GITHUB }}
+        with:
+          use_rsync: true
+          source_file: 'k8s/'
+          destination_repo: veecode-demo01/oci-demo/projetos/argo-repository
+          destination_folder: '/springreview/'
+          destination_branch: 'main'
+          user_email: 'github-admin@vee.codes'
+          user_name: 'veecode-bot'
+          commit_message: 'Moving k8s springreview artefacts'
+      
+      - name: Publish ArgoCD Application config
+        uses: dmnemec/copy_file_to_another_repo_action@main
+        env:
+          API_TOKEN_GITHUB: ${{ secrets.API_TOKEN_GITHUB }}
+        with:
+          use_rsync: true
+          source_file: 'config/'
+          destination_repo: veecode-demo01/oci-demo/projetos/argo-repository
+          destination_folder: '/config/'
+          destination_branch: 'main'
+          user_email: 'github-admin@vee.codes'
+          user_name: 'veecode-bot'
+          commit_message: 'Configuring springreview argocd application'
+
+  publish-spec:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      MOCK_SERVER: ""
+      NAME: ""    
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install yq
+        run: |
+          wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          chmod a+x /usr/local/bin/yq
+          yq --version
+
+      - name: Publishing spec to mockserver
+        if: "${{ env.MOCK_SERVER != '' }}"
+        continue-on-error: true
+        run: |
+          NAME=`echo $GITHUB_REPOSITORY |awk -F / '{print $2 }'`
+          touch MOCK.yaml
+          yq 'with(.paths; with_entries(.key |=strenv(NAME) + .))' ./openapi-swagger.yaml >> MOCK.yaml
+          cat MOCK.yaml | python -c 'import sys, yaml, json; print(json.dumps(yaml.safe_load(sys.stdin.read()), indent=2, sort_keys=False))' > MOCK.json
+          curl --max-time 30 -v -X PUT "${{ env.MOCK_SERVER }}/mockserver/openapi$([ ! -z "$API_KEY" ] && echo "?apikey=")" -d "{"specUrlOrPayload": $(cat $PWD/MOCK.json)}"
+          echo "Adding mockserver address to spec"
+          yq ".servers += [{\"url\": \"${{ env.MOCK_SERVER }}$([[ ! "${{ env.MOCK_SERVER }}" == */ ]] && echo "/")${NAME}\"}]" -i ./openapi-swagger.yaml
+
+      - name: Build devportal template
+        env:
+          NAME: ""
+          PATH_API: ""
+          TAGS: "rest, java, openapi"
+        run: |
+          mkdir -p api/
+          NAME=`echo $GITHUB_REPOSITORY |awk -F / '{print $2 }'`
+          echo $NAME
+          touch ".platform/spec-api.yaml"
+          sed --in-place "s|\"|'|g" ./openapi-swagger.yaml
+          yq eval ".apiVersion = \"backstage.io/v1alpha1\"" -i ".platform/spec-api.yaml"
+          yq eval ".kind = \"API\" " -i ".platform/spec-api.yaml"
+          yq eval ".metadata.name=strenv(NAME)" -i ".platform/spec-api.yaml"
+          yq eval ".metadata.title=strenv(NAME)" -i ".platform/spec-api.yaml"
+          yq eval ".metadata.publishedAt=\"$(date '+%Y-%m-%d %T')\"" -i ".platform/spec-api.yaml"
+          yq eval ".metadata.description= \"$(cat ./openapi-swagger.yaml | yq e '.info.description')\"" -i ".platform/spec-api.yaml"
+          yq eval ".metadata.tags = (strenv(TAGS) | sub(\" +\", \"\") | split(\",\"))" -i ".platform/spec-api.yaml"
+          yq eval ".spec.type = \"openapi\"" -i ".platform/spec-api.yaml"
+          yq eval ".spec.lifecycle = \"production\"" -i ".platform/spec-api.yaml"
+          yq eval ".spec.owner = \"consumer\"" -i ".platform/spec-api.yaml"
+          yq eval ".spec.definition = \"$(yq -I4 ./openapi-swagger.yaml)\"" --inplace ".platform/spec-api.yaml"
+      
+      - name: Publish spec
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          repository: ".platform/"
+          commit_user_name: veecode-bot
+          commit_user_email: github-admin@vee.codes
+          commit_author: veecode-bot<github-admin@vee.codes>
+          commit_message: "Publish api"
+          push_options: '--force'
+
+        
